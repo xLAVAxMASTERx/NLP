@@ -1,89 +1,143 @@
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, TensorDataset
+
+# Load the datasets
+data0 = pd.read_csv('data0.csv')
+data1 = pd.read_csv('data1.csv')
+
+# Assuming 'string' columns contain the text
+plain_text = data0['string']
+encoded_text = data1['string']
+def create_vocab(text_series):
+    vocab = set(''.join(text_series))
+    vocab.add('<PAD>')  # Padding
+    vocab.add('<EOS>')  # End of Sentence
+    char_to_int = {char: idx for idx, char in enumerate(sorted(vocab))}
+    int_to_char = {idx: char for char, idx in char_to_int.items()}
+    return char_to_int, int_to_char
+
+char_to_int, int_to_char = create_vocab(pd.concat([plain_text, encoded_text]))
+assert '<EOS>' in char_to_int, "The EOS token must be in the vocabulary"
+
 import torch
+from torch.utils.data import Dataset, DataLoader
 
-# Load CSV
-data = pd.read_csv('data0csv')  # Assuming columns 'noisy_text' and 'clean_text'
-noisy_texts = data['noisy_text'].tolist()
-clean_texts = data['clean_text'].tolist()
+class TextDataset(Dataset):
+    def __init__(self, encoded, plain, char_to_int):
+        self.encoded = encoded
+        self.plain = plain
+        self.char_to_int = char_to_int
 
-# Assuming texts are already pre-processed and tokenized (index-based)
-noisy_train, noisy_test, clean_train, clean_test = train_test_split(noisy_texts, clean_texts, test_size=0.2, random_state42)
+    def __len__(self):
+        return len(self.encoded)
 
-# Create Tensor datasets
-train_dataset = TensorDataset(torch.tensor(noisy_train, dtype=torch.long), torch.tensor(clean_train, dtype=torch.long))
-test_dataset = TensorDataset(torch.tensor(noisy_test, dtype=torch.long), torch.tensor(clean_test, dtype=torch.long))
+    def __getitem__(self, idx):
+        # Convert character to indices for encoded text
+        encoded_seq = [self.char_to_int[char] for char in self.encoded.iloc[idx]]
+        
+        # Convert character to indices for plain text, and append the EOS token
+        plain_seq = [self.char_to_int[char] for char in self.plain.iloc[idx]]
+        plain_seq.append(self.char_to_int['<EOS>'])  # adding <EOS> as a separate token
 
-train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False)
+        return torch.tensor(encoded_seq), torch.tensor(plain_seq)
+def collate_batch(batch):
+    # Unzip the batch data
+    encoded_seqs, plain_seqs = zip(*batch)
+    
+    # Compute max lengths for zero padding
+    max_encoded_length = max([seq.size(0) for seq in encoded_seqs])
+    max_plain_length = max([seq.size(0) for seq in plain_seqs])
+    
+    # Prepare padded batches
+    encoded_batch = torch.zeros(len(encoded_seqs), max_encoded_length, dtype=torch.long)
+    plain_batch = torch.zeros(len(plain_seqs), max_plain_length, dtype=torch.long)
+    
+    # Fill up the tensors with padded data
+    for i, (enc_seq, pln_seq) in enumerate(zip(encoded_seqs, plain_seqs)):
+        encoded_batch[i, :enc_seq.size(0)] = enc_seq
+        plain_batch[i, :pln_seq.size(0)] = pln_seq
+
+    return encoded_batch, plain_batch
+
+dataset = TextDataset(encoded_text, plain_text, char_to_int)
+loader = DataLoader(dataset, batch_size=64, shuffle=True, collate_fn=collate_batch)
 import torch.nn as nn
 
-class SequenceAutoencoder(nn.Module):
+class Seq2Seq(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_dim):
-        super(SequenceAutoencoder, self).__init__()
-        self.encoder = nn.LSTM(embedding_dim, hidden_dim, batch_first=True)
-        self.decoder = nn.LSTM(hidden_dim, embedding_dim, batch_first=True)
+        super(Seq2Seq, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.output_layer = nn.Linear(embedding_dim, vocab_size)
+        self.encoder = nn.GRU(embedding_dim, hidden_dim, batch_first=True)
+        self.decoder = nn.GRU(embedding_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, vocab_size)
 
-    def forward(self, x):
-        x = self.embedding(x)
-        _, (hidden, _) = self.encoder(x)
-        decoded, _ = self.decoder(hidden.unsqueeze(0))
-        out = self.output_layer(decoded.squeeze(0))
-        return out
-def train_autoencoders(train_loader, test_loader, device, num_autoencoders=5):
-    autoencoders = []
-    for i in range(num_autoencoders):
-        autoencoder = SequenceAutoencoder(vocab_size, embedding_dim, hidden_dim)
-        if autoencoders:  # Transfer learned weights except for the first one
-            autoencoder.load_state_dict(autoencoders[-1].state_dict())
-        train_autoencoder(autoencoder, train_loader, device)
-        autoencoders.append(autoencoder)
-    return autoencoders
-def evaluate_autoencoders(autoencoders, test_loader, device):
-    test_loss = 0
-    criterion = nn.CrossEntropyLoss()
+    def forward(self, src, tgt):
+        embedded_src = self.embedding(src)
+        _, hidden = self.encoder(embedded_src)
+
+        embedded_tgt = self.embedding(tgt)
+        output, _ = self.decoder(embedded_tgt, hidden)
+        return self.fc(output)
+
+model = Seq2Seq(len(char_to_int), 256, 512)
+from torch.optim import Adam
+from torch.nn import CrossEntropyLoss
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+optimizer = Adam(model.parameters())
+criterion = CrossEntropyLoss(ignore_index=char_to_int['<PAD>'])
+
+def train(model, loader, optimizer, criterion, epochs):
+    model.train()
+    for epoch in range(epochs):
+        for encoded, plain in loader:
+            encoded, plain = encoded.to(device), plain.to(device)
+            optimizer.zero_grad()
+            output = model(encoded, plain[:, :-1])
+            loss = criterion(output.reshape(-1, output.shape[2]), plain[:, 1:].reshape(-1))
+            loss.backward()
+            optimizer.step()
+            print(f"Epoch {epoch}, Loss: {loss.item()}")
+
+train(model, loader, optimizer, criterion, 20)
+torch.save(model.state_dict(), 'seq2seq_model.pth')
+def decode(encoded_text, model, char_to_int, int_to_char, device):
+    model.eval()
     with torch.no_grad():
-        for inputs, targets in test_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            for autoencoder in autoencoders:
-                outputs = autoencoder(inputs)
-                inputs = outputs.argmax(dim=-1)  # Feed the output as next input
-            test_loss += criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1)).item()
- return test_loss
-import torch
-import torch.nn.functional as F
-
-def binary_tree_search(autoencoders, input_text, target_text, level=0, current_text=None, path=None, best_score=float('inf'), best_path=None):
-    if current_text is None:
-        current_text = input_text
-    if path is None:
-        path = []
-    if best_path is None:
-        best_path = []
+        # Convert the input string to a sequence of indices
+        encoded_seq = torch.tensor([char_to_int[char] for char in encoded_text]).unsqueeze(0).to(device)
         
-    if level == len(autoencoders):
-        # Calculate similarity index (lower CrossEntropy means higher similarity)
-        current_score = F.cross_entropy(current_text, target_text, reduction='mean').item()
-        if current_score < best_score:
-            return (path.copy(), current_score)
-        return (best_path, best_score)
-    
-    # Case 1: Do not use the current autoencoder
-    path_without = path.copy()
-    result_without, score_without = binary_tree_search(autoencoders, input_text, target_text, level + 1, current_text, path_without, best_score, best_path)
-    
-    # Case 2: Use the current autoencoder
-    path_with = path.copy()
-    path_with.append(level)
-    autoencoder_output = autoencoders[level](current_text)
-    result_with, score_with = binary_tree_search(autoencoders, input_text, target_text, level + 1, autoencoder_output, path_with, best_score, best_path)
-    
-    # Determine which path is better
-    if score_without < score_with:
-        return result_without, score_without
-    else:
-        return result_with, score_with
+        # Initialize the tensor for storing the output indices
+        outputs = []
+        
+        # Predict the initial hidden state with the encoder
+        embedded = model.embedding(encoded_seq)
+        _, hidden = model.encoder(embedded)
+        
+        # Start the decoding process, assume the start token is the first character of the encoded text
+        input = torch.tensor([char_to_int[encoded_text[0]]], device=device)
 
+        while True:
+            # Predict the next token
+            embedded = model.embedding(input.unsqueeze(0))
+            output, hidden = model.decoder(embedded, hidden)
+            output = model.fc(output.squeeze(0))
+            
+            # Find the character with the highest probability
+            predicted = output.argmax(1).item()
+            outputs.append(predicted)
+            
+            # Break if the EOS token was predicted
+            if int_to_char[predicted] == '<EOS>':
+                break
+            
+            # Update the input for the next prediction
+            input = torch.tensor([predicted], device=device)
+
+        # Convert the list of indices to a string
+        decoded_text = ''.join([int_to_char[idx] for idx in outputs if int_to_char[idx] != '<EOS>'])
+        return decoded_text
+
+# Example of decoding
+decoded_text = decode("YMJ RTRJSY FX XYFWYQJI FX N MNX MFSI HQTXJI QNPJ", model, char_to_int, int_to_char, device)
+print(decoded_text)
